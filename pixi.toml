@@ -1,0 +1,18 @@
+[workspace]
+name = "zubercal-embeddings"
+version = "0.1.0"
+description = "Astra-CLR embeddings for Zubercal DR"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+cuda-version = "12.*"
+cuda-cudart = "*"
+libcublas = "*"
+cudnn = "9.*"
+
+[activation]
+env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
+
+[tasks]
+main = { cmd = "uv run python main.py" }
