@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+from contextlib import nullcontext
 from time import perf_counter
 
 import lsdb
@@ -8,6 +9,8 @@ import pandas as pd
 import pyarrow as pa
 from astra_infer import Infer, preprocess_many
 from dask.distributed import Client
+from lsdb.core.crossmatch import crossmatch_args
+from lsdb.core.crossmatch.abstract_crossmatch_algorithm import AbstractCrossmatchAlgorithm
 from lsdb.core.crossmatch.kdtree_match import KdTreeCrossmatch
 from nested_pandas.utils import count_nested
 from upath import UPath
@@ -30,6 +33,8 @@ def parse_cli_args(argv=None):
                         help="run with .head(5) on each partition")
     parser.add_argument("--output", default=None, type=UPath,
                         help="Output path, if not provided, compute into memory and print the head")
+    parser.add_argument("--debug", action="store_true",
+                        help="run in debug mode: no Dask Cluster, single partition only")
     return parser.parse_args(argv)
 
 
@@ -89,20 +94,18 @@ def embed(df):
     return df
 
 
-class SelfmatchAlgo(KdTreeCrossmatch):
+class SelfmatchAlgo(AbstractCrossmatchAlgorithm):
     def __init__(self, n_neighbors, radius_arcsec, id_col: str = "objectid"):
-         super().__init__(n_neighbors=n_neighbors, radius_arcsec=radius_arcsec, min_radius_arcsec=0.0)
-         self.id_col = id_col
+        self.kdtree_algo = KdTreeCrossmatch(n_neighbors=n_neighbors, radius_arcsec=radius_arcsec, min_radius_arcsec=0.0)
+        self.id_col = id_col
 
-    @property
-    def extra_columns(self) -> pd.DataFrame:
-        return pd.DataFrame({
-            "_dist_arcsec": pd.Series(dtype=pd.ArrowDtype(pa.float64())),
-            self.id_col: pd.Series(dtype=pd.ArrowDtype(pa.uint64())),
-        })
+    extra_columns = pd.DataFrame({
+        "_dist_arcsec": pd.Series(dtype=pd.ArrowDtype(pa.float64())),
+        "koid": pd.Series(dtype=pd.ArrowDtype(pa.int64())),
+    })
     
     def perform_crossmatch(self, crossmatch_args):
-        left_idx, right_idx, extra_columns = super().perform_crossmatch(crossmatch_args)
+        left_idx, right_idx, kdtree_extra_columns = self.kdtree_algo.perform_crossmatch(crossmatch_args)
         
         partition_oids = frozenset(crossmatch_args.left_df[self.id_col])
 
@@ -113,17 +116,19 @@ class SelfmatchAlgo(KdTreeCrossmatch):
             __right_index=np.arange(len(crossmatch_args.right_df)),
         )
         
-        id_ndf = super()._create_nested_crossmatch_df(
+        id_ndf = self.kdtree_algo._create_nested_crossmatch_df(
             left_df=left_id_df,
             right_df=right_id_df,
             left_idx=left_idx,
             right_idx=right_idx,
-            extra_cols=extra_cols,
+            extra_cols=kdtree_extra_columns,
             nested_column_name="__right",
             how="inner",
         )
+
+        koid_dtype = self.extra_columns.dtypes["koid"]
         if len(id_ndf) == 0:
-            id_ndf = id_ndf.assign(koid=np.array([], dtype=np.int64), n_matches=np.array([], dtype=np.int64))
+            id_ndf = id_ndf.assign(koid=np.array([], dtype=koid_dtype), n_matches=np.array([], dtype=np.int64))
         else:    
             id_ndf = id_ndf.map_rows(
                 lambda right_oids: (np.min(right_oids), np.size(right_oids)),
@@ -132,6 +137,7 @@ class SelfmatchAlgo(KdTreeCrossmatch):
                 output_names=["koid", "n_matches"],
                 append_columns=True,
             )
+            id_ndf["koid"] = id_ndf["koid"].astype(koid_dtype)
         id_ndf = id_ndf.loc[id_ndf["koid"].isin(id_ndf[self.id_col])]
         id_ndf = id_ndf.loc[id_ndf[["koid", "n_matches"]].groupby("koid")["n_matches"].idxmax()]
 
@@ -147,11 +153,23 @@ class SelfmatchAlgo(KdTreeCrossmatch):
         return (
             np.asarray(id_flat_df["__left_index"]),
             np.asarray(id_flat_df["__right_index"]),
-            id_flat_df[["_dist_arcsec", self.id_col]],
+            id_flat_df[["_dist_arcsec", "koid"]],
         )
 
 
-def finilize_self_match(df):
+def finalize_self_match(df):
+    if len(df) == 0:
+        df = df.assign(koid=np.array([], dtype=np.int64))
+    else:
+        df = df.map_rows(
+            lambda koids: koids[0],
+            columns=["lc.koid"],
+            output_names=["koid"],
+            append_columns=True,
+            row_container="args",
+        )
+    df = df.drop(columns=["lc.koid"])
+
     # Split "lc" into "matches" and actual lightcurves
     df["matches"] = df["lc"]
     df["matches.oid"] = df["matches.objectid"]
@@ -202,7 +220,11 @@ def count(df):
     assert len(df) == old_size
     
     return counts
-    
+
+
+class DummyClient:
+    dashboard_link = "<NO DASK CLUSTER>"
+
 
 def main():
     args = parse_cli_args()
@@ -237,7 +259,7 @@ def main():
             id_col="objectid",
         ),
     ).map_partitions(
-        finilize_self_match,
+        finalize_self_match,
     ).query(
         f"lc.list_lengths >= {MIN_NOBS}",
     )
@@ -261,12 +283,18 @@ def main():
         hats_name = "ztfdr24_selfmatch"
     else:
         raise ValueError(f"Unknown action: {args.action}")
-        
+
     n_workers = min(n_workers, xmatch.npartitions)
-    
+
+    if args.debug:
+        xmatch = xmatch.partitions[0]
+        client_cb = lambda: nullcontext(DummyClient())
+    else:
+        client_cb = lambda: Client(n_workers=n_workers, threads_per_worker=1, memory_limit="128GB")
+
     print(f"{xmatch.npartitions = }")
     t1 = perf_counter()
-    with Client(n_workers=n_workers, threads_per_worker=1, memory_limit="128GB") as client:
+    with client_cb() as client:
         print(f"Dask dashboard: {client.dashboard_link}")
         if args.output is None:
             df = xmatch.compute()
