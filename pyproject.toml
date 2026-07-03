@@ -3,17 +3,18 @@ name = "zubercal-embeddings"
 version = "0.1.0"
 description = "Astra-CLR embeddings for Zubercal DR"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "astra-infer",
     "dask[distributed]>=2026.3.0",
+    "dask-jobqueue",
+    "frisky",
     "hats",
     "ipykernel>=7.2.0",
     "lsdb>=0.9.0",
     # "lsdb-custom-graphs",
     "nested-pandas",
     "numpy>=2.4.4",
-    "onnxruntime>=1.25.1",
     "pandas>=2.3.3",
     "pandas-stubs~=2.3.3",
     "pyarrow>=24.0.0",
@@ -23,6 +24,7 @@ dependencies = [
 
 [tool.uv.sources]
 astra-infer = { git = "https://github.com/snad-space/astra-infer", rev = "main" }
-#hats = { git = "https://github.com/astronomy-commons/hats", rev = "main" }
-#lsdb = { git = "https://github.com/astronomy-commons/lsdb", rev = "operations" }
+hats = { git = "https://github.com/astronomy-commons/hats", rev = "main" }
+lsdb = { git = "https://github.com/astronomy-commons/lsdb", rev = "operations" }
 # lsdb-custom-graphs = { git = "https://github.com/lincc-frameworks/lsdb-custom-graphs", rev = "main" }
+# nested-pandas = { git = "https://github.com/lincc-frameworks/nested-pandas", rev = "rechunking" }

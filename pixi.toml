@@ -1,18 +1,20 @@
 [workspace]
-name = "zubercal-embeddings"
+name = "ztfdr24-embeddings"
 version = "0.1.0"
 description = "Astra-CLR embeddings for Zubercal DR"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
 [dependencies]
-cuda-version = "12.*"
-cuda-cudart = "*"
+cuda-toolkit = "12.*"
+# cuda-version = "12.*"
+cuda-cudart = "12.*"
 libcublas = "*"
 cudnn = "9.*"
 
-[activation]
-env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
+[activation.env]
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+ARROW_DEFAULT_MEMORY_POOL = "jemalloc"
 
 [tasks]
-main = { cmd = "uv run python main.py" }
+embed = { cmd = "uv run --with=onnxruntime-gpu==1.26 python main.py embed --cluster=slurm-gpu" }

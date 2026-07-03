@@ -1,14 +1,20 @@
+import os
 from argparse import ArgumentParser
 from contextlib import nullcontext
+from dataclasses import dataclass
 from time import perf_counter
 
+import dask
+import dask_jobqueue
 import lsdb
 import numpy as np
 import onnxruntime as ort
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute
 from astra_infer import Infer, preprocess_many
 from dask.distributed import Client
+#from frisky import Client
 from lsdb.core.crossmatch import crossmatch_args
 from lsdb.core.crossmatch.abstract_crossmatch_algorithm import AbstractCrossmatchAlgorithm
 from lsdb.core.crossmatch.kdtree_match import KdTreeCrossmatch
@@ -16,12 +22,42 @@ from nested_pandas.utils import count_nested
 from upath import UPath
 
 
-MIN_NOBS = 1000
+dask.config.set({
+    "dataframe.convert-string": False,
+    "distributed.nanny.environ.ARROW_DEFAULT_MEMORY_POOL": "jemalloc",
+})
+
+
+MIN_NOBS = 2000
 NDIMS_EMBEDDING = 512
 MODEL_PATH = UPath("./best_contrastive.onnx")
 NUMPY_TYPE = np.float16
 ARROW_TYPE = pa.list_(pa.float16(), list_size=NDIMS_EMBEDDING)
 PANDAS_DTYPE = pd.ArrowDtype(ARROW_TYPE)
+
+
+def tmp_folder() -> UPath | None:
+    if "LOCAL" not in os.environ:
+        return None
+    
+    local_dir = UPath(os.environ["LOCAL"])
+    if "USER" in os.environ:
+        local_dir / os.environ["USER"]
+    return local_dir
+
+
+@dataclass
+class GPUNode:
+    name: str
+    cores_per_gpu: int
+    memory_per_gpu: int
+
+
+GPU_NODES = {
+    "h100-80": GPUNode("h100-80", 12, 256),
+    "l40s-48": GPUNode("l40s-48", 24, 128),
+    "v100-32": GPUNode("v100-32", 5, 64),
+}
 
 
 def parse_cli_args(argv=None):
@@ -31,10 +67,14 @@ def parse_cli_args(argv=None):
                         help="'order,pixel' for healpix, 'start:end' for partition range, 'full' or omit for all")
     parser.add_argument("--head", action="store_true",
                         help="run with .head(5) on each partition")
+    parser.add_argument("--cluster", default="local-cpu", choices=["local-cpu", "slurm-gpu"],
+                        help="type of the Dask cluster")
+    parser.add_argument("--gpu-node", default=GPU_NODES["l40s-48"], type=GPU_NODES.get, choices=list(GPU_NODES.values()),
+                        help="type of PSC Bridges2 GPU nodes")
     parser.add_argument("--output", default=None, type=UPath,
                         help="Output path, if not provided, compute into memory and print the head")
     parser.add_argument("--debug", action="store_true",
-                        help="run in debug mode: no Dask Cluster, single partition only")
+                        help="run in debug mode: no Dask Cluster, single partition only, ignores --cluster")
     return parser.parse_args(argv)
 
 
@@ -45,6 +85,14 @@ def prepare_lc_catalog(df):
     df["lightcurve.filterid"] = df["filterid"]
     df = df.drop(columns=["filterid"])
     return df
+
+
+class Job(dask_jobqueue.slurm.SLURMJob):
+    # Rewrite the default, which is a property equal to cores/processes
+    worker_process_threads = 2
+
+class Cluster(dask_jobqueue.SLURMCluster):
+    job_cls = Job
 
 
 def parse_region(s):
@@ -69,15 +117,35 @@ def embedding_into_series(a, index):
     return pd.Series(list_array, dtype=PANDAS_DTYPE, index=index)
 
 
-def embed(df):
+def embed(df, *, gpu: bool, cores_per_gpu: int):
     so = ort.SessionOptions()
-    # so.intra_op_num_threads = 4
-    # so.inter_op_num_threads = 1
+    providers = None
+    if gpu:
+        if len(df) == 0:
+            so.intra_op_num_threads = 1
+            so.inter_op_num_threads = 1
+        else:
+            available_providers = ort.get_available_providers()
+            if "CUDAExecutionProvider" not in available_providers:
+                raise RuntimeError(
+                    f"GPU requested but CUDAExecutionProvider is not available. "
+                    f"Available providers: {available_providers}"
+                )
+            so.intra_op_num_threads = cores_per_gpu
+            so.inter_op_num_threads = 1
+            providers = ['CUDAExecutionProvider']
     model = Infer(
         MODEL_PATH,
-        # providers=['CUDAExecutionProvider'],
+        providers=providers,
         sess_options=so,
     )
+    if gpu and len(df) > 0:
+        actual = model._session.get_providers()
+        if "CUDAExecutionProvider" not in actual:
+            raise RuntimeError(
+                f"GPU requested but onnxruntime session fell back to CPU. "
+                f"Actual providers: {actual}"
+            )
     
     lc_array = pa.array(df["lc"])
     inputs = preprocess_many(
@@ -184,7 +252,14 @@ def finalize_self_match(df):
     df["lc"] = df["lc"].nest.to_flatten_inner("lightcurve")
     df = df.sort_values("lc.hmjd")
     assert df["lc.filterid"].notna().all()
-    df["lc.band"] = df["lc.filterid"].map({1: "g", 2: "r", 3: "i"})
+    if len(df) == 0:
+        df["lc.band"] = pd.Series([], dtype=pd.ArrowDtype(pa.string()))
+    else:
+        filterid = pa.array(df["lc.filterid"])
+        filterid_minus_1 = pa.compute.subtract(filterid, 1)
+        ztf_bands = pa.array(["g", "r", "i"])
+        band = pa.compute.take(ztf_bands, filterid_minus_1)
+        df["lc.band"] = pd.Series(band, dtype=pd.ArrowDtype(pa.string()), index=df["lc"].nest.flat_index)
     assert df["lc.band"].notna().all()
     df = df.drop(columns=["lc.filterid"])
 
@@ -241,7 +316,8 @@ def main():
     ]
 
     catalog = lsdb.open_catalog(
-        "s3://ipac-irsa-ztf/ztf/enhanced/dr24/lc/hats",
+        # "s3://ipac-irsa-ztf/ztf/enhanced/dr24/lc/hats",
+        "/ocean/projects/phy210048p/shared/hats/catalogs/ztf_dr24/ztf_dr24_lc",
         columns=columns,
         search_filter=search_filter,
     )
@@ -271,30 +347,56 @@ def main():
         xmatch = xmatch.map_partitions(lambda df: df.head(5))
     
     if args.action == "embed":
-        xmatch = xmatch.map_partitions(embed)
-        n_workers = 2
+        xmatch = xmatch.map_partitions(embed, gpu="gpu" in args.cluster, cores_per_gpu=args.gpu_node.cores_per_gpu)
+        n_workers_local_cluster = 2
         hats_name = "ztfdr24_astra_embeddings"
     elif args.action == "count":
         xmatch = xmatch.map_partitions(count)
-        n_workers = 8
+        n_workers_local_cluster = 16
         hats_name = "ztfdr24_nobs"
     elif args.action == "none":
-        n_workers = 8
+        n_workers_local_cluster = 16
         hats_name = "ztfdr24_selfmatch"
     else:
         raise ValueError(f"Unknown action: {args.action}")
 
-    n_workers = min(n_workers, xmatch.npartitions)
+    n_workers_local_cluster = min(n_workers_local_cluster, xmatch.npartitions)
 
     if args.debug:
         xmatch = xmatch.partitions[0]
-        client_cb = lambda: nullcontext(DummyClient())
+        cluster_cb = lambda: nullcontext(None)
+        client_cb = lambda cluster: nullcontext(DummyClient())
     else:
-        client_cb = lambda: Client(n_workers=n_workers, threads_per_worker=1, memory_limit="128GB")
+        match args.cluster:
+            case "slurm-gpu":
+                def cluster_cb():
+                    cluster = Cluster(
+                        processes=1,
+                        queue="GPU-shared",
+                        cores=args.gpu_node.cores_per_gpu,
+                        memory=f"{args.gpu_node.memory_per_gpu}GB",
+                        walltime="24:00:00",
+                        job_extra_directives=[
+                            f"--gres=gpu:{args.gpu_node.name}:1",
+                        ],
+                        python="pixi run uv run --with=onnxruntime-gpu==1.26 python"
+                    )
+                    cluster.adapt(maximum_jobs=16)
+                    return cluster
+            case "local-cpu":
+                cluster_cb = lambda: LocalCluster(
+                    n_workers=n_workers_local_cluster,
+                    threads_per_worker=1,
+                    memory_limit="128GB",
+                    local_directory=tmp_folder(),
+                )
+            case _:
+                raise ValueError(f"--cluster={args.cluster} is unknown")
+        client_cb = lambda cluster: Client(cluster)
 
     print(f"{xmatch.npartitions = }")
     t1 = perf_counter()
-    with client_cb() as client:
+    with cluster_cb() as cluster, client_cb(cluster) as client:
         print(f"Dask dashboard: {client.dashboard_link}")
         if args.output is None:
             df = xmatch.compute()
